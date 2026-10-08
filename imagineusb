@@ -116,6 +116,7 @@ clean_path() {
 # Muestra al usuario una ruta abreviando su home con ~
 pretty_path() {
   case $1 in
+    "$USER_HOME")   printf '~' ;;
     "$USER_HOME"/*) printf '~/%s' "${1#"$USER_HOME"/}" ;;
     *) printf '%s' "$1" ;;
   esac
@@ -153,6 +154,8 @@ read_key() {
     case $rest in
       '[A'|'OA') KEY=up ;;
       '[B'|'OB') KEY=down ;;
+      '[C'|'OC') KEY=right ;;
+      '[D'|'OD') KEY=left ;;
       *)         KEY=esc ;;
     esac
   elif [ -z "$k" ]; then
@@ -161,7 +164,10 @@ read_key() {
     case $k in
       k|K) KEY=up ;;
       j|J) KEY=down ;;
+      h|H) KEY=left ;;
+      l|L) KEY=right ;;
       q|Q) KEY=quit ;;
+      .)   KEY=dot ;;
       ' ') KEY=space ;;
       a|A) KEY=all ;;
       r|R) KEY=rescan ;;
@@ -272,6 +278,115 @@ multimenu() {
   MULTI_CHOICE=${MULTI_CHOICE# }
   printf '\n'
   return 0
+}
+
+# _list_dirs carpeta mostrar_ocultas(0/1)  → BROWSE_DIRS (nombres de subcarpetas)
+_list_dirs() {
+  local dir=${1%/} hidden=$2 e ng
+  local -a pats
+  BROWSE_DIRS=()
+  ng=$(shopt -p nullglob); shopt -s nullglob
+  pats=("$dir"/*)
+  [ "$hidden" = 1 ] && pats=("${pats[@]}" "$dir"/.[!.]* "$dir"/..?*)
+  for e in "${pats[@]}"; do
+    [ -d "$e" ] && BROWSE_DIRS[${#BROWSE_DIRS[@]}]=${e##*/}
+  done
+  eval "$ng"
+}
+
+# pick_dir "título" carpeta_inicial  → PICKED_DIR / retorna 1 si se cancela
+# Navegador de carpetas: ↑/↓ moverse, → o Enter entrar, ← subir, Enter en "✔" elegir.
+pick_dir() {
+  local title=$1 dir=$2 sel=0 top=0 h rows cols n nfixed i idx first=1 hidden=0
+  local reload=1 back="" free="" msg="" shown target rc=0
+  local -a items
+  rows=$(tput lines 2>/dev/null)
+  [ -n "$rows" ] && [ "$rows" -gt 10 ] 2>/dev/null || rows=24
+  h=$((rows - 12)); [ $h -gt 15 ] && h=15; [ $h -lt 5 ] && h=5
+  printf '  %s%s?%s %s%s%s\n' "$BOLD" "$C_SKY" "$R" "$BOLD" "$title" "$R"
+  printf '  %s↑/↓ moverse · →/Enter entrar · ← subir · . ocultas · Enter en ✔ elegir · q volver%s\n' "$C_DIM" "$R"
+  hide_cursor
+  while :; do
+    if [ $reload -eq 1 ]; then
+      _list_dirs "$dir" $hidden
+      items=("✔  Guardar en esta carpeta")
+      [ "$dir" != / ] && items[1]="..  carpeta superior"
+      nfixed=${#items[@]}
+      for i in "${BROWSE_DIRS[@]}"; do items[${#items[@]}]="$i/"; done
+      n=${#items[@]}
+      sel=0; top=0
+      if [ -n "$back" ]; then
+        i=$nfixed
+        while [ $i -lt $n ]; do
+          [ "${items[$i]}" = "$back/" ] && { sel=$i; break; }
+          i=$((i + 1))
+        done
+      fi
+      free=$(free_bytes "$dir")
+      reload=0
+    fi
+    [ $sel -lt $top ] && top=$sel
+    [ $sel -ge $((top + h)) ] && top=$((sel - h + 1))
+
+    [ $first -eq 1 ] || printf '\033[%dA' $((h + 2))
+    first=0
+    cols=$(term_cols)
+    shown=$(pretty_path "$dir")
+    [ ${#shown} -gt $((cols - 30)) ] && shown="…${shown:$(( ${#shown} - cols + 31 ))}"
+    printf '\r\033[2K  %s%s%s%s' "$BOLD" "$C_PALE" "$shown" "$R"
+    [ -n "$free" ] && printf '  %s%s libres%s' "$C_DIM" "$(human "$free")" "$R"
+    printf '\n'
+    i=0
+    while [ $i -lt $h ]; do
+      idx=$((top + i))
+      if [ $idx -ge $n ]; then printf '\r\033[2K\n'
+      elif [ $idx -eq $sel ]; then _menu_row 1 "" "${items[$idx]}"
+      else _menu_row 0 "" "${items[$idx]}"; fi
+      i=$((i + 1))
+    done
+    printf '\r\033[2K'
+    if [ -n "$msg" ]; then
+      printf '    %s%s%s' "$C_WARN" "$msg" "$R"; msg=""
+    else
+      printf '    %s%d carpeta(s)' "$C_DIM" $((n - nfixed))
+      [ $n -gt $h ] && printf ' · %d–%d de %d' $((top + 1)) $(( top + h < n ? top + h : n )) "$n"
+      printf '%s' "$R"
+    fi
+    printf '\n'
+
+    read_key
+    target=""
+    case $KEY in
+      up)    sel=$(( (sel - 1 + n) % n )) ;;
+      down)  sel=$(( (sel + 1) % n )) ;;
+      enter|right)
+        if [ $sel -eq 0 ]; then
+          [ "$KEY" = enter ] && { PICKED_DIR=$dir; break; }
+        elif [ $sel -lt $nfixed ]; then
+          target=..
+        else
+          target="${dir%/}/${items[$sel]%/}"
+        fi ;;
+      left)  [ "$dir" != / ] && target=.. ;;
+      dot)   hidden=$((1 - hidden)); back=""
+             [ $sel -ge $nfixed ] && back=${items[$sel]%/}
+             reload=1 ;;
+      quit|esc) rc=1; break ;;
+    esac
+    if [ "$target" = .. ]; then
+      back=${dir##*/}; dir=$(dirname "$dir"); reload=1
+    elif [ -n "$target" ]; then
+      if ls "$target" >/dev/null 2>&1; then
+        dir=$target; back=""; reload=1
+      else
+        msg="No se puede abrir ${target##*/}: sin permiso"
+      fi
+    fi
+  done
+  # Borra el navegador para dejar la pantalla limpia
+  printf '\033[%dA\r\033[J' $((h + 3))
+  show_cursor
+  return $rc
 }
 
 # ask "pregunta" [default]  → ANSWER   (con autocompletado de rutas por Tab)
@@ -574,7 +689,8 @@ _job_line() {  # índice total elapsed
   done=$(_dd_bytes "${JOB_LOG[$j]}"); [ -z "$done" ] && done=0
   [ "$done" -gt "$total" ] && done=$total
   pct=0; [ "$total" -gt 0 ] && pct=$(( done * 100 / total ))
-  w=$(( $(term_cols) - 62 )); [ $w -gt 34 ] && w=34; [ $w -lt 10 ] && w=10
+  # ~66 columnas de texto fijo + margen para ETA con horas
+  w=$(( $(term_cols) - 70 )); [ $w -gt 34 ] && w=34; [ $w -lt 10 ] && w=10
   printf '\r\033[2K  %s%s%s ' "$C_PALE" "$label" "$R"
   if [ -n "${JOB_RC[$j]}" ]; then
     if [ "${JOB_RC[$j]}" = 0 ]; then
@@ -616,6 +732,9 @@ run_copies() {
   done
   start=$(date +%s)
   hide_cursor
+  # Sin autowrap: una línea más ancha que la terminal se recorta en vez de
+  # ocupar dos filas y romper el redibujado en el lugar
+  [ -t 1 ] && printf '\033[?7l'
   sleep 0.3
   while :; do
     running=0
@@ -642,6 +761,7 @@ run_copies() {
     [ $running -eq 0 ] && break
     sleep 0.6
   done
+  [ -t 1 ] && printf '\033[?7h'
   show_cursor
   ELAPSED=$el
   j=0
@@ -663,7 +783,7 @@ run_copies() {
 summary_row() { printf '    %s%-9s%s %s\n' "$C_DIM" "$1" "$R" "$2"; }
 
 flow_read() {
-  local d dev size name dest def_name def_path free
+  local d dev size name dest def_name dir fname free
   section "Levantar imagen  ·  disco → archivo"
   pick_disk "¿De qué disco querés levantar la imagen?" || return
   d=$PICKED; dev=${DISK_DEV[$d]}; size=${DISK_SIZE[$d]}
@@ -674,22 +794,36 @@ flow_read() {
   name=$(printf '%s' "${DISK_NAME[$d]}" | tr -cs 'A-Za-z0-9._-' '-' | sed 's/^-*//; s/-*$//')
   [ -z "$name" ] && name="disco"
   def_name="$name-$(date +%Y%m%d-%H%M).img"
-  if [ -d "$USER_HOME/Desktop" ]; then def_path="$USER_HOME/Desktop/$def_name"; else def_path="$USER_HOME/$def_name"; fi
 
+  dir=$USER_HOME
   while :; do
-    ask "¿Dónde querés guardar la imagen? (archivo o carpeta, Tab autocompleta)" "$(pretty_path "$def_path")"
-    dest=$(clean_path "$ANSWER")
-    [ -z "$dest" ] && continue
-    case $dest in /*) ;; *) dest="$PWD/$dest" ;; esac
-    [ -d "$dest" ] && dest="${dest%/}/$def_name"
-    if [ ! -d "$(dirname "$dest")" ]; then
-      err "La carpeta $(dirname "$dest") no existe."; continue
-    fi
-    if [ -e "$dest" ]; then
-      warn "El archivo $(pretty_path "$dest") ya existe."
-      confirm "¿Sobrescribirlo?" || continue
-    fi
-    break
+    pick_dir "¿En qué carpeta querés guardar la imagen?" "$dir" || return
+    dir=$PICKED_DIR
+    ok "Carpeta: $(pretty_path "$dir")"
+    while :; do
+      ask "Nombre del archivo de imagen" "$def_name"
+      fname=$(clean_path "$ANSWER")
+      case $fname in
+        */*)    err "El nombre no puede contener «/»."; continue ;;
+        .|..|"") err "Nombre inválido."; continue ;;
+      esac
+      dest="${dir%/}/$fname"
+      if [ -d "$dest" ]; then
+        err "Ya existe una carpeta llamada $fname."; continue
+      fi
+      if [ -e "$dest" ]; then
+        warn "El archivo $(pretty_path "$dest") ya existe ($(human "$(file_size "$dest")"))."
+        menu "¿Qué hacemos?" \
+          "Elegir otro nombre" \
+          "Elegir otra carpeta" \
+          "Sobrescribirlo|se pierde el contenido actual" || continue
+        case $MENU_CHOICE in
+          0) continue ;;
+          1) continue 2 ;;
+        esac
+      fi
+      break 2
+    done
   done
 
   free=$(free_bytes "$(dirname "$dest")")
@@ -837,6 +971,7 @@ EOF
 cleanup() {
   local p
   for p in "${JOB_PID[@]}"; do kill "$p" 2>/dev/null; done
+  [ -t 1 ] && printf '\033[?7h'
   show_cursor
   stty echo 2>/dev/null
 }

@@ -25,7 +25,11 @@ sudo imagineusb --all    # incluye discos internos que no sean del sistema
 
 Controles: `↑/↓` (o `j/k`) para moverse, `Enter` para elegir, `q`/`Esc` para volver.
 En la selección de discos destino: `Espacio` marca, `a` marca todos, `r` vuelve a escanear.
-Para las rutas hay autocompletado con `Tab`, y se puede arrastrar el archivo a la terminal.
+Al levantar una imagen, la carpeta destino se elige con un navegador que arranca en tu home:
+`→`/`Enter` entra a una carpeta, `←` sube, `.` muestra/oculta carpetas ocultas y `Enter` sobre
+`✔ Guardar en esta carpeta` la elige. Después se pide el nombre del archivo (con uno sugerido)
+y, si ya existe, se avisa y se puede elegir otro nombre, otra carpeta o sobrescribirlo.
+Para la imagen a quemar hay autocompletado con `Tab`, y se puede arrastrar el archivo a la terminal.
 
 ## Cómo elige los discos
 
