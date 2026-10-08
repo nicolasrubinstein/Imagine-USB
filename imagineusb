@@ -1,0 +1,910 @@
+#!/usr/bin/env bash
+#
+#  imagineusb — levantar y quemar imágenes de disco sobre dd (macOS / Linux)
+#
+#  Uso:  sudo imagineusb [--all] [--help] [--version]
+#
+#  Compatible con bash 3.2 (el bash que trae macOS).
+
+VERSION="1.0.0"
+SHOW_ALL=0
+OS="$(uname -s)"
+
+# ───────────────────────────── colores ──────────────────────────────
+
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  R=$'\033[0m'; BOLD=$'\033[1m'
+  C_NAVY=$'\033[38;5;25m'
+  C_DEEP=$'\033[38;5;27m'
+  C_MAIN=$'\033[38;5;33m'
+  C_SKY=$'\033[38;5;39m'
+  C_LIGHT=$'\033[38;5;75m'
+  C_PALE=$'\033[38;5;117m'
+  C_ICE=$'\033[38;5;153m'
+  C_DIM=$'\033[38;5;244m'
+  C_OK=$'\033[38;5;80m'
+  C_WARN=$'\033[38;5;214m'
+  C_ERR=$'\033[38;5;203m'
+  C_SEL=$'\033[48;5;25m\033[38;5;231m\033[1m'
+  BAR_COLORS="25 26 27 32 33 38 39 45 75 81 117"
+else
+  R=""; BOLD=""; C_NAVY=""; C_DEEP=""; C_MAIN=""; C_SKY=""; C_LIGHT=""
+  C_PALE=""; C_ICE=""; C_DIM=""; C_OK=""; C_WARN=""; C_ERR=""; C_SEL=""
+  BAR_COLORS=""
+fi
+
+hide_cursor() { [ -t 1 ] && printf '\033[?25l'; }
+show_cursor() { [ -t 1 ] && printf '\033[?25h'; }
+term_cols()   { local c; c=$(tput cols 2>/dev/null); [ -n "$c" ] && [ "$c" -gt 20 ] 2>/dev/null && echo "$c" || echo 80; }
+
+info()  { printf '  %sℹ%s  %s\n' "$C_SKY" "$R" "$*"; }
+ok()    { printf '  %s✔%s  %s\n' "$C_OK" "$R" "$*"; }
+warn()  { printf '  %s⚠  %s%s\n' "$C_WARN" "$*" "$R"; }
+err()   { printf '  %s✖  %s%s\n' "$C_ERR" "$*" "$R" >&2; }
+die()   { err "$*"; exit 1; }
+
+section() {
+  local title=$1 cols line
+  cols=$(term_cols); [ "$cols" -gt 72 ] && cols=72
+  line=$(printf '%*s' $((cols - ${#title} - 8)) '' | tr ' ' '━')
+  printf '\n  %s━━%s %s%s%s %s%s%s\n\n' "$C_DEEP" "$R" "$BOLD$C_PALE" "$title" "$R" "$C_DEEP" "$line" "$R"
+}
+
+banner() {
+  printf '\n'
+  printf '  %s╭──────────────────────────────────────────────╮%s\n' "$C_NAVY" "$R"
+  printf '  %s│%s   %s▄▀▄%s  %si m a g i n e%s %su s b%s                   %s│%s\n' \
+    "$C_NAVY" "$R" "$C_SKY" "$R" "$BOLD$C_PALE" "$R" "$BOLD$C_MAIN" "$R" "$C_NAVY" "$R"
+  printf '  %s│%s   %s▀▄▀%s  %slevantá y quemá imágenes de disco%s     %s│%s\n' \
+    "$C_NAVY" "$R" "$C_DEEP" "$R" "$C_LIGHT" "$R" "$C_NAVY" "$R"
+  printf '  %s╰──────────────────────────────────────────────╯%s\n' "$C_NAVY" "$R"
+  printf '  %sv%s · %s · sobre dd%s\n' "$C_DIM" "$VERSION" "$OS" "$R"
+}
+
+# ───────────────────────────── utilidades ───────────────────────────
+
+human() {
+  awk -v b="$1" 'BEGIN { split("B KB MB GB TB PB", u, " "); i = 1
+    while (b >= 1000 && i < 6) { b /= 1000; i++ }
+    if (i == 1) printf "%d %s", b, u[i]; else printf "%.1f %s", b, u[i] }'
+}
+
+fmt_time() {
+  local s=$1
+  if [ "$s" -ge 3600 ]; then printf '%d:%02d:%02d' $((s/3600)) $((s%3600/60)) $((s%60))
+  else printf '%02d:%02d' $((s/60)) $((s%60)); fi
+}
+
+file_size() {
+  if [ "$OS" = "Darwin" ]; then stat -f%z "$1"; else stat -c%s "$1"; fi
+}
+
+free_bytes() {  # espacio libre en el filesystem que contiene $1
+  df -Pk "$1" 2>/dev/null | awk 'NR==2 { printf "%.0f", $4 * 1024 }'
+}
+
+user_home() {
+  local h=""
+  if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+    if [ "$OS" = "Darwin" ]; then
+      h=$(dscl . -read "/Users/$SUDO_USER" NFSHomeDirectory 2>/dev/null | awk '{print $2}')
+    else
+      h=$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)
+    fi
+  fi
+  [ -n "$h" ] && echo "$h" || echo "$HOME"
+}
+
+# Limpia rutas pegadas o arrastradas desde el Finder/explorador:
+# espacios sobrantes, comillas, barras de escape y ~
+clean_path() {
+  local p=$1
+  p="${p#"${p%%[![:space:]]*}"}"
+  p="${p%"${p##*[![:space:]]}"}"
+  case $p in
+    \"*\") p=${p#\"}; p=${p%\"} ;;
+    \'*\') p=${p#\'}; p=${p%\'} ;;
+    *)     p=$(printf '%s' "$p" | sed 's/\\\(.\)/\1/g') ;;
+  esac
+  case $p in
+    "~")   p=$USER_HOME ;;
+    "~/"*) p="$USER_HOME/${p#\~/}" ;;
+  esac
+  printf '%s' "$p"
+}
+
+# Muestra al usuario una ruta abreviando su home con ~
+pretty_path() {
+  case $1 in
+    "$USER_HOME"/*) printf '~/%s' "${1#"$USER_HOME"/}" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+spin() {  # spin "mensaje" comando args...
+  local msg=$1; shift
+  local log frames i=0 pid rc
+  log=$(mktemp "${TMPDIR:-/tmp}/imagineusb.XXXXXX")
+  frames="⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+  "$@" >"$log" 2>&1 &
+  pid=$!
+  hide_cursor
+  while kill -0 "$pid" 2>/dev/null; do
+    printf '\r  %s%s%s  %s' "$C_SKY" "${frames:$((i % 10)):1}" "$R" "$msg"
+    i=$((i + 1)); sleep 0.1
+  done
+  wait "$pid"; rc=$?
+  printf '\r\033[2K'
+  show_cursor
+  if [ $rc -eq 0 ]; then ok "$msg"
+  else err "$msg — falló"; sed 's/^/       /' "$log" >&2; fi
+  rm -f "$log"
+  return $rc
+}
+
+# ───────────────────────────── entrada ──────────────────────────────
+
+read_key() {
+  local k rest
+  if ! IFS= read -rsn1 k; then KEY=quit; return; fi
+  if [ "$k" = $'\033' ]; then
+    rest=""
+    IFS= read -rsn2 -t 1 rest
+    case $rest in
+      '[A'|'OA') KEY=up ;;
+      '[B'|'OB') KEY=down ;;
+      *)         KEY=esc ;;
+    esac
+  elif [ -z "$k" ]; then
+    KEY=enter
+  else
+    case $k in
+      k|K) KEY=up ;;
+      j|J) KEY=down ;;
+      q|Q) KEY=quit ;;
+      ' ') KEY=space ;;
+      a|A) KEY=all ;;
+      r|R) KEY=rescan ;;
+      [1-9]) KEY="num$k" ;;
+      *)   KEY=other ;;
+    esac
+  fi
+}
+
+# Dibuja una fila de menú. Los ítems pueden tener la forma "etiqueta|detalle".
+_menu_row() {  # selected(0/1) marker texto
+  local selected=$1 marker=$2 item=$3 label detail maxw
+  label=${item%%|*}
+  detail=""
+  case $item in *"|"*) detail=${item#*|} ;; esac
+  maxw=$(( $(term_cols) - 10 - ${#marker} ))
+  label=${label:0:$maxw}
+  maxw=$((maxw - ${#label} - 2))
+  [ $maxw -lt 0 ] && maxw=0
+  detail=${detail:0:$maxw}
+  printf '\r\033[2K'
+  if [ "$selected" = 1 ]; then
+    printf '  %s❯%s %s%s %s%s' "$C_SKY" "$R" "$marker" "$C_SEL" "$label" "$R"
+    [ -n "$detail" ] && printf '  %s%s%s' "$C_PALE" "$detail" "$R"
+  else
+    printf '    %s%s%s%s' "$marker" "$C_LIGHT" "$label" "$R"
+    [ -n "$detail" ] && printf '  %s%s%s' "$C_DIM" "$detail" "$R"
+  fi
+  printf '\n'
+}
+
+# menu "título" opción1 opción2 ...   → MENU_CHOICE (índice) / retorna 1 si se cancela
+menu() {
+  local title=$1; shift
+  local -a items
+  items=("$@")
+  local n=${#items[@]} sel=0 i first=1 d
+  printf '  %s%s?%s %s%s%s\n' "$BOLD" "$C_SKY" "$R" "$BOLD" "$title" "$R"
+  printf '  %s↑/↓ moverse · Enter elegir · q volver%s\n' "$C_DIM" "$R"
+  hide_cursor
+  while :; do
+    [ $first -eq 1 ] || printf '\033[%dA' "$n"
+    first=0
+    i=0
+    while [ $i -lt $n ]; do
+      if [ $i -eq $sel ]; then _menu_row 1 "" "${items[$i]}"; else _menu_row 0 "" "${items[$i]}"; fi
+      i=$((i + 1))
+    done
+    read_key
+    case $KEY in
+      up)    sel=$(( (sel - 1 + n) % n )) ;;
+      down)  sel=$(( (sel + 1) % n )) ;;
+      enter) break ;;
+      num*)  d=${KEY#num}; [ "$d" -le "$n" ] && sel=$((d - 1)) ;;
+      quit|esc) show_cursor; MENU_CHOICE=-1; printf '\n'; return 1 ;;
+    esac
+  done
+  show_cursor
+  MENU_CHOICE=$sel
+  printf '\n'
+  return 0
+}
+
+# multimenu "título" opción1 ...  → MULTI_CHOICE ("0 2 3")
+# Retorna 1 si se cancela, 2 si se pide volver a escanear.
+multimenu() {
+  local title=$1; shift
+  local -a items checked
+  items=("$@")
+  local n=${#items[@]} sel=0 i first=1 d any mark
+  i=0; while [ $i -lt $n ]; do checked[$i]=0; i=$((i + 1)); done
+  printf '  %s%s?%s %s%s%s\n' "$BOLD" "$C_SKY" "$R" "$BOLD" "$title" "$R"
+  printf '  %s↑/↓ moverse · Espacio marcar · a todos · Enter confirmar · r re-escanear · q volver%s\n' "$C_DIM" "$R"
+  hide_cursor
+  while :; do
+    [ $first -eq 1 ] || printf '\033[%dA' "$((n + 1))"
+    first=0
+    i=0
+    while [ $i -lt $n ]; do
+      if [ "${checked[$i]}" = 1 ]; then mark="${C_SKY}◉${R} "; else mark="${C_DIM}○${R} "; fi
+      if [ $i -eq $sel ]; then _menu_row 1 "$mark" "${items[$i]}"; else _menu_row 0 "$mark" "${items[$i]}"; fi
+      i=$((i + 1))
+    done
+    any=0; i=0
+    while [ $i -lt $n ]; do [ "${checked[$i]}" = 1 ] && any=$((any + 1)); i=$((i + 1)); done
+    printf '\r\033[2K    %s%d seleccionado(s)%s\n' "$C_PALE" "$any" "$R"
+    read_key
+    case $KEY in
+      up)    sel=$(( (sel - 1 + n) % n )) ;;
+      down)  sel=$(( (sel + 1) % n )) ;;
+      space) if [ "${checked[$sel]}" = 1 ]; then checked[$sel]=0; else checked[$sel]=1; fi ;;
+      all)   d=1; [ $any -eq $n ] && d=0
+             i=0; while [ $i -lt $n ]; do checked[$i]=$d; i=$((i + 1)); done ;;
+      num*)  d=${KEY#num}; [ "$d" -le "$n" ] && sel=$((d - 1)) ;;
+      enter) [ $any -eq 0 ] && checked[$sel]=1   # Enter sin marcar nada = el resaltado
+             break ;;
+      rescan) show_cursor; printf '\n'; return 2 ;;
+      quit|esc) show_cursor; printf '\n'; return 1 ;;
+    esac
+  done
+  show_cursor
+  MULTI_CHOICE=""
+  i=0
+  while [ $i -lt $n ]; do
+    [ "${checked[$i]}" = 1 ] && MULTI_CHOICE="$MULTI_CHOICE $i"
+    i=$((i + 1))
+  done
+  MULTI_CHOICE=${MULTI_CHOICE# }
+  printf '\n'
+  return 0
+}
+
+# ask "pregunta" [default]  → ANSWER   (con autocompletado de rutas por Tab)
+ask() {
+  local q=$1 def=${2:-} p
+  p=$'\001'"$BOLD$C_SKY"$'\002'"  ? "$'\001'"$R$BOLD"$'\002'"$q"$'\001'"$R"$'\002'
+  if [ -n "$def" ]; then
+    p="$p "$'\001'"$C_DIM"$'\002'"[$def]"$'\001'"$R"$'\002'
+  fi
+  p="$p"$'\n'$'\001'"$C_SKY"$'\002'"  ❯ "$'\001'"$R"$'\002'
+  ANSWER=""
+  IFS= read -e -r -p "$p" ANSWER || ANSWER=""
+  [ -z "$ANSWER" ] && ANSWER=$def
+  return 0
+}
+
+confirm() {  # confirm "pregunta"  → 0 sí / 1 no (default No)
+  menu "$1" "No, volver" "Sí, continuar" || return 1
+  [ "$MENU_CHOICE" -eq 1 ]
+}
+
+pause() {
+  printf '\n  %sPresioná Enter para volver al menú…%s' "$C_DIM" "$R"
+  IFS= read -rs _ || true
+  printf '\n'
+}
+
+# ───────────────────────────── discos ───────────────────────────────
+
+# Arrays paralelos con los discos candidatos
+DISK_DEV=(); DISK_NAME=(); DISK_SIZE=(); DISK_BUS=(); DISK_RM=()
+
+_add_disk() {
+  local i=${#DISK_DEV[@]}
+  DISK_DEV[$i]=$1; DISK_NAME[$i]=$2; DISK_SIZE[$i]=$3; DISK_BUS[$i]=$4; DISK_RM[$i]=$5
+}
+
+_mac_field() {  # _mac_field "$info" "Clave"
+  printf '%s\n' "$1" | sed -n "s|^ *$2: *||p" | head -1
+}
+
+mac_system_disks() {
+  local whole
+  whole=$(_mac_field "$(diskutil info / 2>/dev/null)" "Part of Whole")
+  [ -z "$whole" ] && return
+  echo "$whole"
+  diskutil list "$whole" 2>/dev/null | grep -Eo 'Physical Store disk[0-9]+' | awk '{print $3}'
+}
+
+mac_scan_disks() {
+  local sys dev kind inf size name bus rm
+  sys=" $(mac_system_disks | tr '\n' ' ') "
+  diskutil list 2>/dev/null | sed -n 's|^\(/dev/disk[0-9][0-9]*\) (\(.*\)):$|\1 \2|p' |
+  while read -r dev kind; do echo "$dev|$kind"; done > "$SCAN_TMP"
+  while IFS='|' read -r dev kind; do
+    case $kind in *physical*) ;; *) continue ;; esac
+    case "$sys" in *" ${dev#/dev/} "*) continue ;; esac
+    inf=$(diskutil info "$dev" 2>/dev/null) || continue
+    rm=$(_mac_field "$inf" "Removable Media")
+    if [ $SHOW_ALL -eq 0 ]; then
+      case $kind in
+        *external*) ;;
+        *) [ "$rm" = "Removable" ] || continue ;;
+      esac
+    fi
+    size=$(printf '%s\n' "$inf" | sed -n 's/.*Size:.*(\([0-9][0-9]*\) Bytes).*/\1/p' | head -1)
+    [ -z "$size" ] || [ "$size" = 0 ] && continue
+    name=$(_mac_field "$inf" "Device / Media Name")
+    [ -z "$name" ] && name="(sin nombre)"
+    bus=$(_mac_field "$inf" "Protocol")
+    [ "$rm" = "Removable" ] && rm=1 || rm=0
+    _add_disk "$dev" "$name" "$size" "$bus" "$rm"
+  done < "$SCAN_TMP"
+}
+
+linux_system_disks() {
+  local mp src
+  {
+    for mp in / /boot /boot/efi /efi /usr /var /home; do
+      findmnt -no SOURCE "$mp" 2>/dev/null
+    done
+    swapon --noheadings --show=NAME 2>/dev/null
+  } | while read -r src; do
+    src=${src%%\[*}
+    [ -b "$src" ] || continue
+    lsblk -nlpso NAME,TYPE "$src" 2>/dev/null | awk '$2 == "disk" { print $1 }'
+  done | sort -u
+}
+
+# Un disco con particiones montadas fuera de /media, /mnt o /run/media
+# se considera del sistema aunque no esté en la lista anterior.
+linux_has_system_mounts() {
+  local mp
+  while IFS= read -r mp; do
+    case $mp in
+      ""|/media/*|/mnt|/mnt/*|/run/media/*) ;;
+      *) return 0 ;;
+    esac
+  done <<EOF
+$(lsblk -nlpo MOUNTPOINT "$1" 2>/dev/null)
+EOF
+  return 1
+}
+
+linux_scan_disks() {
+  local sys dev type size rm tran model
+  sys=" $(linux_system_disks | tr '\n' ' ') "
+  lsblk -dnpo NAME 2>/dev/null > "$SCAN_TMP"
+  while read -r dev; do
+    [ -b "$dev" ] || continue
+    type=$(lsblk -dno TYPE "$dev" 2>/dev/null)
+    [ "$type" = "disk" ] || continue
+    case $dev in */loop*|*/ram*|*/zram*|*boot[0-9]*|*rpmb*) continue ;; esac
+    case "$sys" in *" $dev "*) continue ;; esac
+    linux_has_system_mounts "$dev" && continue
+    size=$(lsblk -dnbo SIZE "$dev" 2>/dev/null | tr -d ' ')
+    [ -z "$size" ] || [ "$size" = 0 ] && continue
+    rm=$(lsblk -dno RM "$dev" 2>/dev/null | tr -d ' ')
+    tran=$(lsblk -dno TRAN "$dev" 2>/dev/null | tr -d ' ')
+    if [ $SHOW_ALL -eq 0 ] && [ "$rm" != 1 ]; then
+      case "$tran:$dev" in usb:*|mmc:*|sdio:*|ieee1394:*|*:/dev/mmcblk*) ;; *) continue ;; esac
+    fi
+    model=$(lsblk -dno MODEL "$dev" 2>/dev/null | sed 's/ *$//')
+    [ -z "$model" ] && model=$(lsblk -dno VENDOR "$dev" 2>/dev/null | sed 's/ *$//')
+    [ -z "$model" ] && model="(sin nombre)"
+    _add_disk "$dev" "$model" "$size" "$(printf '%s' "$tran" | tr 'a-z' 'A-Z')" "${rm:-0}"
+  done < "$SCAN_TMP"
+}
+
+scan_disks() {
+  DISK_DEV=(); DISK_NAME=(); DISK_SIZE=(); DISK_BUS=(); DISK_RM=()
+  SCAN_TMP=$(mktemp "${TMPDIR:-/tmp}/imagineusb.XXXXXX")
+  if [ "$OS" = "Darwin" ]; then mac_scan_disks; else linux_scan_disks; fi
+  rm -f "$SCAN_TMP"
+}
+
+disk_item() {  # índice → "disk4      SanDisk Ultra|32.0 GB · USB · removible"
+  local i=$1 extra=""
+  [ -n "${DISK_BUS[$i]}" ] && extra=" · ${DISK_BUS[$i]}"
+  [ "${DISK_RM[$i]}" = 1 ] && extra="$extra · removible"
+  printf '%-12s %-26s|%s%s' "${DISK_DEV[$i]#/dev/}" "${DISK_NAME[$i]}" "$(human "${DISK_SIZE[$i]}")" "$extra"
+}
+
+disk_desc() {  # índice → "/dev/disk4 · SanDisk Ultra (32.0 GB)"
+  printf '%s · %s (%s)' "${DISK_DEV[$1]}" "${DISK_NAME[$1]}" "$(human "${DISK_SIZE[$1]}")"
+}
+
+no_disks_msg() {
+  warn "No se encontraron discos externos."
+  printf '     %sConectá el pendrive / tarjeta SD y volvé a escanear.%s\n' "$C_DIM" "$R"
+  [ $SHOW_ALL -eq 0 ] && printf '     %s(con --all se muestran también discos internos que no son del sistema)%s\n' "$C_DIM" "$R"
+  printf '\n'
+}
+no_disks_lines() { echo $(( SHOW_ALL == 0 ? 4 : 3 )); }
+
+# pick_disk "título" [dev_a_excluir]  → PICKED (índice en DISK_*)
+pick_disk() {
+  local title=$1 exclude=${2:-} i
+  local -a items idx
+  while :; do
+    scan_disks
+    items=(); idx=()
+    i=0
+    while [ $i -lt ${#DISK_DEV[@]} ]; do
+      if [ "${DISK_DEV[$i]}" != "$exclude" ]; then
+        idx[${#idx[@]}]=$i
+        items[${#items[@]}]="$(disk_item $i)"
+      fi
+      i=$((i + 1))
+    done
+    [ ${#items[@]} -eq 0 ] && no_disks_msg
+    items[${#items[@]}]="↻  Volver a escanear"
+    items[${#items[@]}]="←  Volver"
+    menu "$title" "${items[@]}" || return 1
+    if [ "$MENU_CHOICE" -lt ${#idx[@]} ]; then
+      PICKED=${idx[$MENU_CHOICE]}
+      return 0
+    fi
+    [ "$MENU_CHOICE" -eq $(( ${#items[@]} - 1 )) ] && return 1
+    printf '\033[%dA\033[J' $(( ${#items[@]} + 3 + (${#idx[@]} == 0 ? $(no_disks_lines) : 0) ))
+  done
+}
+
+# pick_disks "título" [dev_a_excluir]  → PICKED_LIST ("0 3")
+pick_disks() {
+  local title=$1 exclude=${2:-} i rc c
+  local -a items idx
+  while :; do
+    scan_disks
+    items=(); idx=()
+    i=0
+    while [ $i -lt ${#DISK_DEV[@]} ]; do
+      if [ "${DISK_DEV[$i]}" != "$exclude" ]; then
+        idx[${#idx[@]}]=$i
+        items[${#items[@]}]="$(disk_item $i)"
+      fi
+      i=$((i + 1))
+    done
+    if [ ${#items[@]} -eq 0 ]; then
+      no_disks_msg
+      menu "¿Qué hacemos?" "↻  Volver a escanear" "←  Volver" || return 1
+      [ "$MENU_CHOICE" -eq 1 ] && return 1
+      printf '\033[%dA\033[J' $(( $(no_disks_lines) + 5 ))
+      continue
+    fi
+    multimenu "$title" "${items[@]}"; rc=$?
+    case $rc in
+      0) PICKED_LIST=""
+         for c in $MULTI_CHOICE; do PICKED_LIST="$PICKED_LIST ${idx[$c]}"; done
+         PICKED_LIST=${PICKED_LIST# }
+         return 0 ;;
+      2) printf '\033[%dA\033[J' $(( ${#items[@]} + 4 )) ;;
+      *) return 1 ;;
+    esac
+  done
+}
+
+show_partitions() {
+  local dev=$1
+  printf '  %sTabla de particiones de %s:%s\n' "$C_DIM" "$dev" "$R"
+  if [ "$OS" = "Darwin" ]; then
+    diskutil list "$dev" 2>/dev/null | sed -n '2,$p'
+  elif command -v fdisk >/dev/null 2>&1; then
+    fdisk -l "$dev" 2>/dev/null | sed -n '/^Device\|^Disposit\|^\/dev/p'
+  else
+    lsblk "$dev" 2>/dev/null
+  fi | sed "s/^/    $C_DIM/; s/\$/$R/"
+  printf '\n'
+}
+
+unmount_disk() {
+  local dev=$1 p
+  if [ "$OS" = "Darwin" ]; then
+    diskutil unmountDisk "$dev"
+  else
+    for p in $(lsblk -nlpo NAME "$dev" 2>/dev/null); do
+      umount "$p" 2>/dev/null
+    done
+    if lsblk -nlpo MOUNTPOINT "$dev" 2>/dev/null | grep -q .; then
+      echo "Hay particiones que no se pudieron desmontar:"
+      lsblk -nlpo NAME,MOUNTPOINT "$dev"
+      return 1
+    fi
+  fi
+}
+
+eject_disk() {
+  local dev=$1
+  if [ "$OS" = "Darwin" ]; then
+    diskutil eject "$dev"
+  elif command -v udisksctl >/dev/null 2>&1; then
+    sync; udisksctl power-off -b "$dev"
+  elif command -v eject >/dev/null 2>&1; then
+    sync; eject "$dev"
+  else
+    echo "No hay eject ni udisksctl; desconectalo cuando quieras (ya se sincronizó)."
+  fi
+}
+
+# En macOS /dev/rdiskN es mucho más rápido, pero exige escrituras alineadas a
+# sectores: si el origen no es múltiplo de 512 usamos el dispositivo con buffer.
+raw_dev() {  # raw_dev /dev/disk4 [tamaño_origen]
+  if [ "$OS" = "Darwin" ] && { [ -z "${2:-}" ] || [ $(( $2 % 512 )) -eq 0 ]; }; then
+    echo "/dev/r${1#/dev/}"
+  else
+    echo "$1"
+  fi
+}
+
+# ───────────────────────────── copia con dd ─────────────────────────
+
+JOB_PID=(); JOB_LOG=(); JOB_LABEL=(); JOB_RC=()
+
+_dd_bytes() {  # bytes copiados según el log de dd
+  tr '\r' '\n' < "$1" 2>/dev/null | sed -n 's/^ *\([0-9][0-9]*\) bytes.*/\1/p' | tail -1
+}
+
+_bar() {  # _bar porcentaje ancho
+  local pct=$1 w=$2 fill i c out="" ncol
+  local -a cols
+  fill=$(( pct * w / 100 ))
+  cols=($BAR_COLORS); ncol=${#cols[@]}
+  i=0
+  while [ $i -lt $w ]; do
+    if [ $i -lt $fill ]; then
+      if [ $ncol -gt 0 ]; then c=${cols[$(( i * ncol / w ))]}; out="$out"$'\033[38;5;'"${c}m█"
+      else out="$out#"; fi
+    else
+      out="$out${C_NAVY}░"
+      [ $ncol -eq 0 ] && out="${out%░}-"
+    fi
+    i=$((i + 1))
+  done
+  printf '%s%s' "$out" "$R"
+}
+
+_job_line() {  # índice total elapsed
+  local j=$1 total=$2 el=$3 done pct speed eta w label
+  label=$(printf '%-10.10s' "${JOB_LABEL[$j]}")
+  done=$(_dd_bytes "${JOB_LOG[$j]}"); [ -z "$done" ] && done=0
+  [ "$done" -gt "$total" ] && done=$total
+  pct=0; [ "$total" -gt 0 ] && pct=$(( done * 100 / total ))
+  w=$(( $(term_cols) - 62 )); [ $w -gt 34 ] && w=34; [ $w -lt 10 ] && w=10
+  printf '\r\033[2K  %s%s%s ' "$C_PALE" "$label" "$R"
+  if [ -n "${JOB_RC[$j]}" ]; then
+    if [ "${JOB_RC[$j]}" = 0 ]; then
+      printf '%s %s%3d%%%s  %s✔ listo%s · %s\n' "$(_bar 100 $w)" "$BOLD" 100 "$R" "$C_OK" "$R" "$(human "$total")"
+    else
+      printf '%s %s%3d%%%s  %s✖ error (código %s)%s\n' "$(_bar $pct $w)" "$BOLD" "$pct" "$R" "$C_ERR" "${JOB_RC[$j]}" "$R"
+    fi
+    return
+  fi
+  speed=0; [ "$el" -gt 0 ] && speed=$(( done / el ))
+  printf '%s %s%3d%%%s  %s%9s%s / %-9s' "$(_bar $pct $w)" "$BOLD$C_ICE" "$pct" "$R" "$C_LIGHT" "$(human "$done")" "$R" "$(human "$total")"
+  if [ "$done" -ge "$total" ] && [ "$total" -gt 0 ]; then
+    printf '  %svaciando buffers…%s\n' "$C_DIM" "$R"
+  elif [ $speed -gt 0 ]; then
+    eta=$(( (total - done) / speed ))
+    printf '  %s%s/s · ETA %s%s\n' "$C_DIM" "$(human $speed)" "$(fmt_time $eta)" "$R"
+  else
+    printf '  %siniciando…%s\n' "$C_DIM" "$R"
+  fi
+}
+
+# run_copies ORIGEN TOTAL_BYTES ETIQUETA1 DESTINO1 [ETIQUETA2 DESTINO2 ...]
+# Lanza un dd en paralelo por cada destino y dibuja una barra por cada uno.
+run_copies() {
+  local src=$1 total=$2; shift 2
+  local n=0 j running start now el first=1 failed=0
+  JOB_PID=(); JOB_LOG=(); JOB_LABEL=(); JOB_RC=()
+  while [ $# -ge 2 ]; do
+    JOB_LABEL[$n]=$1
+    JOB_LOG[$n]=$(mktemp "${TMPDIR:-/tmp}/imagineusb.XXXXXX")
+    if [ "$OS" = "Darwin" ]; then
+      dd if="$src" of="$2" bs=4m 2>"${JOB_LOG[$n]}" &
+    else
+      dd if="$src" of="$2" bs=4M conv=fsync status=progress 2>"${JOB_LOG[$n]}" &
+    fi
+    JOB_PID[$n]=$!
+    JOB_RC[$n]=""
+    n=$((n + 1)); shift 2
+  done
+  start=$(date +%s)
+  hide_cursor
+  sleep 0.3
+  while :; do
+    running=0
+    j=0
+    while [ $j -lt $n ]; do
+      if [ -z "${JOB_RC[$j]}" ]; then
+        if kill -0 "${JOB_PID[$j]}" 2>/dev/null; then
+          running=$((running + 1))
+          [ "$OS" = "Darwin" ] && kill -INFO "${JOB_PID[$j]}" 2>/dev/null
+        else
+          wait "${JOB_PID[$j]}"; JOB_RC[$j]=$?
+          [ "$OS" = "Darwin" ] && [ "${JOB_RC[$j]}" = 0 ] && [ -z "$(_dd_bytes "${JOB_LOG[$j]}")" ] && echo "$total bytes" >> "${JOB_LOG[$j]}"
+        fi
+      fi
+      j=$((j + 1))
+    done
+    [ $running -gt 0 ] && sleep 0.4
+    now=$(date +%s); el=$((now - start))
+    [ $first -eq 1 ] || printf '\033[%dA' "$((n + 1))"
+    first=0
+    j=0
+    while [ $j -lt $n ]; do _job_line $j "$total" $el; j=$((j + 1)); done
+    printf '\r\033[2K  %stiempo transcurrido %s%s\n' "$C_DIM" "$(fmt_time $el)" "$R"
+    [ $running -eq 0 ] && break
+    sleep 0.6
+  done
+  show_cursor
+  ELAPSED=$el
+  j=0
+  while [ $j -lt $n ]; do
+    if [ "${JOB_RC[$j]}" != 0 ]; then
+      failed=$((failed + 1))
+      err "${JOB_LABEL[$j]}: dd terminó con error:"
+      tr '\r' '\n' < "${JOB_LOG[$j]}" | grep -v 'records\|bytes' | tail -5 | sed 's/^/       /' >&2
+    fi
+    rm -f "${JOB_LOG[$j]}"
+    j=$((j + 1))
+  done
+  JOB_PID=()
+  return $failed
+}
+
+# ───────────────────────────── flujos ───────────────────────────────
+
+summary_row() { printf '    %s%-9s%s %s\n' "$C_DIM" "$1" "$R" "$2"; }
+
+flow_read() {
+  local d dev size name dest def_name def_path free
+  section "Levantar imagen  ·  disco → archivo"
+  pick_disk "¿De qué disco querés levantar la imagen?" || return
+  d=$PICKED; dev=${DISK_DEV[$d]}; size=${DISK_SIZE[$d]}
+  ok "Origen: $(disk_desc $d)"
+  printf '\n'
+  show_partitions "$dev"
+
+  name=$(printf '%s' "${DISK_NAME[$d]}" | tr -cs 'A-Za-z0-9._-' '-' | sed 's/^-*//; s/-*$//')
+  [ -z "$name" ] && name="disco"
+  def_name="$name-$(date +%Y%m%d-%H%M).img"
+  if [ -d "$USER_HOME/Desktop" ]; then def_path="$USER_HOME/Desktop/$def_name"; else def_path="$USER_HOME/$def_name"; fi
+
+  while :; do
+    ask "¿Dónde querés guardar la imagen? (archivo o carpeta, Tab autocompleta)" "$(pretty_path "$def_path")"
+    dest=$(clean_path "$ANSWER")
+    [ -z "$dest" ] && continue
+    case $dest in /*) ;; *) dest="$PWD/$dest" ;; esac
+    [ -d "$dest" ] && dest="${dest%/}/$def_name"
+    if [ ! -d "$(dirname "$dest")" ]; then
+      err "La carpeta $(dirname "$dest") no existe."; continue
+    fi
+    if [ -e "$dest" ]; then
+      warn "El archivo $(pretty_path "$dest") ya existe."
+      confirm "¿Sobrescribirlo?" || continue
+    fi
+    break
+  done
+
+  free=$(free_bytes "$(dirname "$dest")")
+  if [ -n "$free" ] && [ "$free" -lt "$size" ]; then
+    warn "Espacio libre insuficiente: hay $(human "$free") y la imagen ocupa $(human "$size")."
+    confirm "¿Intentar igual?" || return
+  fi
+
+  printf '\n'
+  summary_row "Origen" "$(disk_desc $d)"
+  summary_row "Destino" "$(pretty_path "$dest")"
+  summary_row "Tamaño" "$(human "$size")"
+  printf '\n'
+  confirm "¿Arrancamos?" || return
+
+  spin "Desmontando $dev" unmount_disk "$dev" || return
+  printf '\n'
+  if run_copies "$(raw_dev "$dev")" "$size" "${dev#/dev/}" "$dest"; then
+    if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+      chown "$SUDO_USER:$(id -gn "$SUDO_USER")" "$dest" 2>/dev/null
+    fi
+    printf '\n'
+    ok "${BOLD}Imagen creada${R} en $(pretty_path "$dest") ($(human "$size") en $(fmt_time "$ELAPSED"))"
+  else
+    printf '\n'
+    err "No se pudo levantar la imagen."
+  fi
+  if [ "$OS" = "Darwin" ]; then diskutil mountDisk "$dev" >/dev/null 2>&1; fi
+}
+
+flow_burn() {
+  local src src_label src_desc size src_dev="" i d targets="" args confirm_word failed cnt
+  section "Quemar imagen  ·  origen → disco(s)"
+  menu "¿Qué querés quemar?" \
+    "Un archivo de imagen|.img .iso .raw .bin …" \
+    "Otro dispositivo|clonar un disco en otro(s)" \
+    "←  Volver" || return
+  case $MENU_CHOICE in
+    0)
+      while :; do
+        ask "Ruta del archivo de imagen (podés arrastrarlo acá, Tab autocompleta)"
+        src=$(clean_path "$ANSWER")
+        [ -z "$src" ] && return
+        case $src in /*) ;; *) src="$PWD/$src" ;; esac
+        if [ ! -f "$src" ]; then err "No existe el archivo: $src"; continue; fi
+        if [ ! -r "$src" ]; then err "No se puede leer: $src"; continue; fi
+        size=$(file_size "$src")
+        if [ -z "$size" ] || [ "$size" -eq 0 ]; then err "El archivo está vacío."; continue; fi
+        case $src in
+          *.gz|*.xz|*.zip|*.bz2|*.7z|*.zst)
+            warn "El archivo parece estar comprimido; dd lo copiaría tal cual."
+            printf '     %sDescomprimilo primero para obtener el .img/.iso.%s\n' "$C_DIM" "$R"
+            confirm "¿Usarlo igual?" || continue ;;
+        esac
+        break
+      done
+      src_label=$(basename "$src")
+      src_desc="$(pretty_path "$src") ($(human "$size"))"
+      ok "Origen: $src_desc"
+      ;;
+    1)
+      pick_disk "¿Qué disco querés usar como origen?" || return
+      d=$PICKED; src_dev=${DISK_DEV[$d]}; size=${DISK_SIZE[$d]}
+      src_desc=$(disk_desc $d)
+      ok "Origen: $src_desc"
+      ;;
+    *) return ;;
+  esac
+  printf '\n'
+
+  pick_disks "¿En qué disco(s) querés quemar la imagen?" "$src_dev" || return
+  cnt=0
+  for i in $PICKED_LIST; do
+    cnt=$((cnt + 1))
+    if [ "${DISK_SIZE[$i]}" -lt "$size" ]; then
+      warn "${DISK_DEV[$i]} ($(human "${DISK_SIZE[$i]}")) es más chico que el origen ($(human "$size"))."
+      if [ -n "$src_dev" ]; then
+        confirm "¿Copiar igual? (sólo sirve si los datos entran)" || return
+      else
+        err "La imagen no entra en ${DISK_DEV[$i]}. Elegí otro disco."; return
+      fi
+    fi
+  done
+
+  for i in $PICKED_LIST; do show_partitions "${DISK_DEV[$i]}"; done
+
+  summary_row "Origen" "$src_desc"
+  for i in $PICKED_LIST; do summary_row "Destino" "$(disk_desc $i)"; done
+  printf '\n'
+  printf '  %s%s┃ ATENCIÓN: se va a BORRAR TODO el contenido de %s disco(s).%s\n' "$BOLD" "$C_ERR" "$cnt" "$R"
+  printf '  %s%s┃ Esta operación no se puede deshacer.%s\n\n' "$BOLD" "$C_ERR" "$R"
+  ask "Escribí QUEMAR para confirmar (cualquier otra cosa cancela)"
+  confirm_word=$(printf '%s' "$ANSWER" | tr 'a-z' 'A-Z' | tr -d ' ')
+  if [ "$confirm_word" != "QUEMAR" ]; then info "Cancelado, no se tocó ningún disco."; return; fi
+  printf '\n'
+
+  [ -n "$src_dev" ] && { spin "Desmontando origen $src_dev" unmount_disk "$src_dev" || return; }
+  for i in $PICKED_LIST; do
+    spin "Desmontando ${DISK_DEV[$i]}" unmount_disk "${DISK_DEV[$i]}" || return
+  done
+  printf '\n'
+
+  [ -n "$src_dev" ] && src=$(raw_dev "$src_dev")
+  args=()
+  for i in $PICKED_LIST; do
+    args[${#args[@]}]=${DISK_DEV[$i]#/dev/}
+    args[${#args[@]}]=$(raw_dev "${DISK_DEV[$i]}" "$size")
+  done
+  run_copies "$src" "$size" "${args[@]}"; failed=$?
+  printf '\n'
+  spin "Sincronizando escrituras pendientes" sync
+  printf '\n'
+  if [ $failed -eq 0 ]; then
+    ok "${BOLD}Listo:${R} imagen quemada en $cnt disco(s) en $(fmt_time "$ELAPSED")."
+  else
+    err "$failed de $cnt copia(s) fallaron."
+  fi
+  printf '\n'
+  if confirm "¿Expulsar los discos para retirarlos de forma segura?"; then
+    for i in $PICKED_LIST; do spin "Expulsando ${DISK_DEV[$i]}" eject_disk "${DISK_DEV[$i]}"; done
+    [ -n "$src_dev" ] && spin "Expulsando $src_dev" eject_disk "$src_dev"
+  elif [ "$OS" = "Darwin" ]; then
+    for i in $PICKED_LIST; do diskutil mountDisk "${DISK_DEV[$i]}" >/dev/null 2>&1; done
+    [ -n "$src_dev" ] && diskutil mountDisk "$src_dev" >/dev/null 2>&1
+  fi
+}
+
+# ───────────────────────────── main ─────────────────────────────────
+
+usage() {
+  cat <<EOF
+${BOLD}${C_PALE}imagineusb${R} v$VERSION — levantar y quemar imágenes de disco sobre dd
+
+${C_SKY}Uso:${R}  sudo imagineusb [opciones]
+
+${C_SKY}Opciones:${R}
+  --all        mostrar también discos internos que no sean del sistema
+  -h, --help   mostrar esta ayuda
+  --version    mostrar la versión
+
+Sin opciones abre el asistente interactivo.
+EOF
+}
+
+cleanup() {
+  local p
+  for p in "${JOB_PID[@]}"; do kill "$p" 2>/dev/null; done
+  show_cursor
+  stty echo 2>/dev/null
+}
+
+on_interrupt() {
+  local had_jobs=${#JOB_PID[@]}
+  printf '\n\n'
+  cleanup
+  JOB_PID=()
+  warn "Cancelado por el usuario."
+  [ "$had_jobs" -gt 0 ] && warn "La copia quedó incompleta: el disco/archivo destino no es utilizable."
+  printf '\n'
+  exit 130
+}
+
+main() {
+  local a
+  for a in "$@"; do
+    case $a in
+      --all) SHOW_ALL=1 ;;
+      -h|--help) usage; exit 0 ;;
+      --version) echo "imagineusb $VERSION"; exit 0 ;;
+      *) err "Opción desconocida: $a"; usage; exit 1 ;;
+    esac
+  done
+
+  case $OS in
+    Darwin|Linux) ;;
+    *) die "Sistema no soportado: $OS (sólo macOS y Linux)." ;;
+  esac
+
+  if [ "$(id -u)" -ne 0 ]; then
+    banner
+    printf '\n'
+    info "imagineusb necesita permisos de administrador para leer y escribir discos."
+    info "Relanzando con sudo…"
+    printf '\n'
+    exec sudo "$BASH" "$0" "$@"
+  fi
+
+  command -v dd >/dev/null 2>&1 || die "No se encontró dd."
+  if [ "$OS" = "Darwin" ]; then
+    command -v diskutil >/dev/null 2>&1 || die "No se encontró diskutil."
+  else
+    command -v lsblk >/dev/null 2>&1 || die "No se encontró lsblk (paquete util-linux)."
+  fi
+
+  USER_HOME=$(user_home)
+  trap on_interrupt INT TERM
+  trap cleanup EXIT
+
+  banner
+  while :; do
+    section "Menú principal"
+    menu "¿Qué querés hacer?" \
+      "Levantar una imagen|disco → archivo .img" \
+      "Quemar una imagen|archivo o disco → uno o varios discos" \
+      "Salir" || break
+    case $MENU_CHOICE in
+      0) flow_read; pause ;;
+      1) flow_burn; pause ;;
+      *) break ;;
+    esac
+  done
+  printf '  %s¡Hasta luego!%s\n\n' "$C_SKY" "$R"
+}
+
+# Permite hacer `source imagineusb` para probar funciones sin abrir el asistente
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi
